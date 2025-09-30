@@ -1,37 +1,35 @@
 <?php
 /**
  * Plugin Name: Post Type Renamer
- * Description: Migrate posts from one custom post type to another (e.g., ex_service → service) with a safe, batched UI.
- * Version: 1.0.0
+ * Description: Rename post types and/or custom field keys (meta) in safe batches with an admin UI.
+ * Version: 1.0.1
  * Author: Execute Rajib
- * Text Domain: ex-ptr
+ * Text Domain: ex-ptrx
  * Requires at least: 5.6
- * Requires PHP: 8.1
+ * Requires PHP: 7.4
  * License: GPL-2.0+
  */
 
-if ( ! defined( 'ABSPATH' ) ) {
-	exit;
-}
+if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-class ex_Post_Type_Renamer {
-	const OPTION_STATE = 'ex_ptr_state';
-	const NONCE_FIELD  = 'ex_ptr_nonce';
-	const NONCE_ACTION = 'ex_ptr_action';
-	const CAPABILITY   = 'manage_options';
-	const MENU_SLUG    = 'ex-post-type-renamer';
+class PTR_Extended {
+	const OPTION_STATE      = 'ex_ptrx_state';
+	const NONCE_FIELD       = 'ex_ptrx_nonce';
+	const NONCE_ACTION      = 'ex_ptrx_action';
+	const CAPABILITY        = 'manage_options';
+	const MENU_SLUG         = 'ex-post-type-renamer-extended';
 
 	public function __construct() {
 		add_action( 'admin_menu', [ $this, 'admin_menu' ] );
-		add_action( 'admin_post_ex_ptr_start', [ $this, 'handle_start' ] );
-		add_action( 'admin_post_ex_ptr_step',  [ $this, 'handle_step' ] );
-		add_action( 'admin_post_ex_ptr_reset', [ $this, 'handle_reset' ] );
+		add_action( 'admin_post_ex_ptrx_start', [ $this, 'handle_start' ] );
+		add_action( 'admin_post_ex_ptrx_step',  [ $this, 'handle_step' ] );
+		add_action( 'admin_post_ex_ptrx_reset', [ $this, 'handle_reset' ] );
 	}
 
 	public function admin_menu() {
 		add_management_page(
-			__( 'Post Type Renamer', 'ex-ptr' ),
-			__( 'Post Type Renamer', 'ex-ptr' ),
+			__( 'Post Type Renamer + Meta', 'ex-ptrx' ),
+			__( 'Post Type Renamer + Meta', 'ex-ptrx' ),
 			self::CAPABILITY,
 			self::MENU_SLUG,
 			[ $this, 'render_page' ]
@@ -41,242 +39,219 @@ class ex_Post_Type_Renamer {
 	private function get_state() {
 		$state = get_option( self::OPTION_STATE, [] );
 		$defaults = [
-			'from'       => '',
-			'to'         => '',
-			'total'      => 0,
-			'processed'  => 0,
-			'batch'      => 200,
-			'started_at' => 0,
-			'done'       => false,
-			'last_ids'   => [],
+			'from'         => '',
+			'to'           => '',
+			'total'        => 0,
+			'processed'    => 0,
+			'batch'        => 200,
+			'started_at'   => 0,
+			'done'         => false,
+			'last_ids'     => [],
+			'meta_map'     => [],
+			'delete_old'   => true,
+			'meta_only'    => false,
 		];
 		return wp_parse_args( $state, $defaults );
 	}
 
-	private function save_state( $state ) {
-		update_option( self::OPTION_STATE, $state, false );
+	private function save_state( $state ) { update_option( self::OPTION_STATE, $state, false ); }
+
+	private function parse_meta_map( $raw ) {
+		$map = [];
+		$lines = preg_split( '/\r\n|\r|\n/', (string) $raw );
+		foreach ( $lines as $line ) {
+			$line = trim( $line );
+			if ( '' === $line ) continue;
+			if ( strpos( $line, '=>' ) !== false ) {
+				list( $old, $new ) = array_map( 'trim', explode( '=>', $line, 2 ) );
+			} elseif ( strpos( $line, ':' ) !== false ) {
+				list( $old, $new ) = array_map( 'trim', explode( ':', $line, 2 ) );
+			} elseif ( strpos( $line, '=' ) !== false ) {
+				list( $old, $new ) = array_map( 'trim', explode( '=', $line, 2 ) );
+			} else {
+				continue;
+			}
+			$old = sanitize_key( $old ); $new = sanitize_key( $new );
+			if ( $old && $new && $old !== $new ) { $map[] = [ 'from' => $old, 'to' => $new ]; }
+		}
+		return $map;
 	}
 
 	public function render_page() {
-		if ( ! current_user_can( self::CAPABILITY ) ) {
-			wp_die( esc_html__( 'Sorry, you are not allowed to access this page.', 'ex-ptr' ) );
-		}
+		if ( ! current_user_can( self::CAPABILITY ) ) { wp_die( esc_html__( 'Sorry, you are not allowed to access this page.', 'ex-ptrx' ) ); }
 		$state = $this->get_state();
-		$is_running = ! empty( $state['from'] ) && ! $state['done'] && $state['total'] > 0 && $state['processed'] < $state['total'];
-
+		$is_running = ( ! $state['done'] ) && ( ! empty( $state['from'] ) ) && ( $state['total'] > 0 ) && ( $state['processed'] < $state['total'] );
 		?>
 		<div class="wrap">
-			<h1><?php esc_html_e( 'ex Post Type Renamer', 'ex-ptr' ); ?></h1>
-			<p><?php esc_html_e( 'Convert posts from one custom post type key to another in safe batches. Example: ds_service → service. Make sure the target post type is registered by your theme or a plugin. Back up your database before running.', 'ex-ptr' ); ?></p>
-
-			<?php if ( $notice = get_transient( 'ex_ptr_notice' ) ) : ?>
+			<h1><?php esc_html_e( 'Post Type Renamer + Meta Key Renamer', 'ex-ptrx' ); ?></h1>
+			<p><?php esc_html_e( 'Rename post type and/or custom field keys (meta) in batches.', 'ex-ptrx' ); ?></p>
+			<?php if ( $notice = get_transient( 'ex_ptrx_notice' ) ) : ?>
 				<div class="notice notice-info"><p><?php echo wp_kses_post( $notice ); ?></p></div>
-			<?php delete_transient( 'ex_ptr_notice' ); endif; ?>
+			<?php delete_transient( 'ex_ptrx_notice' ); endif; ?>
 
-			<div class="card" style="max-width:840px;padding:20px;">
-				<h2><?php esc_html_e( 'Setup', 'ex-ptr' ); ?></h2>
+			<div class="card" style="max-width:920px;padding:20px;">
+				<h2><?php esc_html_e( 'Setup', 'ex-ptrx' ); ?></h2>
 				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 					<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_FIELD ); ?>
-					<input type="hidden" name="action" value="ex_ptr_start" />
-
+					<input type="hidden" name="action" value="ex_ptrx_start" />
 					<table class="form-table" role="presentation">
 						<tr>
-							<th scope="row"><label for="ex_ptr_from"><?php esc_html_e( 'From post type', 'ex-ptr' ); ?></label></th>
+							<th scope="row"><label for="from"><?php esc_html_e( 'From post type', 'ex-ptrx' ); ?></label></th>
+							<td><input required class="regular-text" type="text" id="from" name="from" placeholder="e.g. ds_service" value="<?php echo esc_attr( $state['from'] ); ?>"></td>
+						</tr>
+						<tr>
+							<th scope="row"><label for="to"><?php esc_html_e( 'To post type', 'ex-ptrx' ); ?></label></th>
 							<td>
-								<input required class="regular-text" type="text" id="ex_ptr_from" name="from" placeholder="e.g. ds_service" value="<?php echo esc_attr( $state['from'] ); ?>">
-								<p class="description"><?php esc_html_e( 'Existing post type key to migrate from.', 'ex-ptr' ); ?></p>
+								<input class="regular-text" type="text" id="to" name="to" placeholder="e.g. service" value="<?php echo esc_attr( $state['to'] ); ?>">
+								<p class="description"><?php esc_html_e( 'Leave blank for meta-only mode.', 'ex-ptrx' ); ?></p>
 							</td>
 						</tr>
 						<tr>
-							<th scope="row"><label for="ex_ptr_to"><?php esc_html_e( 'To post type', 'ex-ptr' ); ?></label></th>
-							<td>
-								<input required class="regular-text" type="text" id="ex_ptr_to" name="to" placeholder="e.g. service" value="<?php echo esc_attr( $state['to'] ); ?>">
-								<p class="description"><?php esc_html_e( 'Target post type key (must be registered).', 'ex-ptr' ); ?></p>
-							</td>
+							<th scope="row"><label for="batch"><?php esc_html_e( 'Batch size', 'ex-ptrx' ); ?></label></th>
+							<td><input class="small-text" type="number" id="batch" name="batch" min="10" max="2000" step="10" value="<?php echo esc_attr( (int) $state['batch'] ); ?>"></td>
 						</tr>
 						<tr>
-							<th scope="row"><label for="ex_ptr_batch"><?php esc_html_e( 'Batch size', 'ex-ptr' ); ?></label></th>
+							<th scope="row" style="vertical-align:top;"><label for="meta_map"><?php esc_html_e( 'Meta key rename map', 'ex-ptrx' ); ?></label></th>
 							<td>
-								<input class="small-text" type="number" id="ex_ptr_batch" name="batch" min="10" max="2000" step="10" value="<?php echo esc_attr( (int) $state['batch'] ); ?>">
-								<p class="description"><?php esc_html_e( 'How many posts to process per step. Default 200.', 'ex-ptr' ); ?></p>
+								<textarea class="large-text code" id="meta_map" name="meta_map" rows="6" placeholder="ds_service_subtitle => service_subtitle"></textarea>
+								<label><input type="checkbox" name="delete_old" value="1" checked> <?php esc_html_e( 'Delete old meta keys after copying', 'ex-ptrx' ); ?></label><br>
+								<label><input type="checkbox" name="meta_only" value="1"> <?php esc_html_e( 'Meta-only mode (do not change post type)', 'ex-ptrx' ); ?></label>
 							</td>
 						</tr>
 					</table>
-
-					<?php submit_button( __( 'Start Migration', 'ex-ptr' ), 'primary', 'submit', false ); ?>
+					<?php submit_button( __( 'Start', 'ex-ptrx' ), 'primary', 'submit', false ); ?>
 				</form>
 			</div>
 
-			<div class="card" style="max-width:840px;padding:20px;">
-				<h2><?php esc_html_e( 'Progress', 'ex-ptr' ); ?></h2>
+			<div class="card" style="max-width:920px;padding:20px;">
+				<h2><?php esc_html_e( 'Progress', 'ex-ptrx' ); ?></h2>
 				<?php if ( $state['total'] > 0 ) : ?>
-					<p>
-						<strong><?php esc_html_e( 'From', 'ex-ptr' ); ?>:</strong> <?php echo esc_html( $state['from'] ); ?> &nbsp; | &nbsp;
-						<strong><?php esc_html_e( 'To', 'ex-ptr' ); ?>:</strong> <?php echo esc_html( $state['to'] ); ?>
-					</p>
-					<p>
-						<strong><?php esc_html_e( 'Processed', 'ex-ptr' ); ?>:</strong> <?php echo esc_html( (int) $state['processed'] ); ?> / <?php echo esc_html( (int) $state['total'] ); ?>
-					</p>
+					<p><strong><?php esc_html_e( 'From', 'ex-ptrx' ); ?>:</strong> <?php echo esc_html( $state['from'] ); ?> |
+					   <strong><?php esc_html_e( 'To', 'ex-ptrx' ); ?>:</strong> <?php echo esc_html( $state['to'] ?: '—' ); ?></p>
+					<p><strong><?php esc_html_e( 'Processed', 'ex-ptrx' ); ?>:</strong> <?php echo esc_html( (int) $state['processed'] ); ?> / <?php echo esc_html( (int) $state['total'] ); ?></p>
 					<?php if ( ! empty( $state['last_ids'] ) ) : ?>
-						<p class="description"><?php esc_html_e( 'Last processed IDs', 'ex-ptr' ); ?>: <?php echo esc_html( implode( ', ', array_map( 'intval', (array) $state['last_ids'] ) ) ); ?></p>
+						<p class="description"><?php esc_html_e( 'Last IDs', 'ex-ptrx' ); ?>: <?php echo esc_html( implode( ', ', array_map( 'intval', (array) $state['last_ids'] ) ) ); ?></p>
 					<?php endif; ?>
 				<?php else : ?>
-					<p class="description"><?php esc_html_e( 'No active migration yet.', 'ex-ptr' ); ?></p>
+					<p class="description"><?php esc_html_e( 'No active run yet.', 'ex-ptrx' ); ?></p>
 				<?php endif; ?>
 
-				<?php if ( $is_running ) : ?>
-					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" id="ex-ptr-step-form">
+				<?php if ( ( ! $state['done'] ) && $state['total'] > 0 && $state['processed'] < $state['total'] ) : ?>
+					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" id="step-form">
 						<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_FIELD ); ?>
-						<input type="hidden" name="action" value="ex_ptr_step" />
-						<?php submit_button( __( 'Run Next Batch', 'ex-ptr' ), 'secondary', 'submit', false ); ?>
+						<input type="hidden" name="action" value="ex_ptrx_step" />
+						<?php submit_button( __( 'Run Next Batch', 'ex-ptrx' ), 'secondary', 'submit', false ); ?>
 					</form>
-					<script>
-						// Auto-advance every second until done.
-						setTimeout(function(){
-							document.getElementById('ex-ptr-step-form').submit();
-						}, 1000);
-					</script>
+					<script>setTimeout(function(){ document.getElementById('step-form').submit(); }, 1000);</script>
 				<?php elseif ( $state['done'] && $state['total'] > 0 ) : ?>
-					<p><strong><?php esc_html_e( 'Migration complete.', 'ex-ptr' ); ?></strong></p>
+					<p><strong><?php esc_html_e( 'All done.', 'ex-ptrx' ); ?></strong></p>
 					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 						<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_FIELD ); ?>
-						<input type="hidden" name="action" value="ex_ptr_reset" />
-						<?php submit_button( __( 'Reset State', 'ex-ptr' ), 'secondary', 'submit', false ); ?>
+						<input type="hidden" name="action" value="ex_ptrx_reset" />
+						<?php submit_button( __( 'Reset State', 'ex-ptrx' ), 'secondary', 'submit', false ); ?>
 					</form>
 				<?php endif; ?>
-			</div>
-
-			<div class="card" style="max-width:840px;padding:20px;">
-				<h2><?php esc_html_e( 'Notes', 'ex-ptr' ); ?></h2>
-				<ul class="ul-disc">
-					<li><?php esc_html_e( 'Make sure the target post type is registered (by your theme or another plugin) before running. Otherwise posts will still convert, but you will not see them in the admin until it is registered.', 'ex-ptr' ); ?></li>
-					<li><?php esc_html_e( 'After completion, the plugin flushes rewrite rules once.', 'ex-ptr' ); ?></li>
-					<li><?php esc_html_e( 'Taxonomies, meta, thumbnails, Elementor content, etc. stay attached to the posts.', 'ex-ptr' ); ?></li>
-					<li><?php esc_html_e( 'If you are converting large volumes, increase the batch size gradually if needed.', 'ex-ptr' ); ?></li>
-				</ul>
 			</div>
 		</div>
 		<?php
 	}
 
 	public function handle_start() {
-		if ( ! current_user_can( self::CAPABILITY ) ) {
-			wp_die( esc_html__( 'Permission denied.', 'ex-ptr' ) );
-		}
+		if ( ! current_user_can( self::CAPABILITY ) ) { wp_die( esc_html__( 'Permission denied.', 'ex-ptrx' ) ); }
 		check_admin_referer( self::NONCE_ACTION, self::NONCE_FIELD );
 
-		$from  = sanitize_key( $_POST['from'] ?? '' );
-		$to    = sanitize_key( $_POST['to'] ?? '' );
-		$batch = max( 10, min( 2000, intval( $_POST['batch'] ?? 200 ) ) );
+		$from   = sanitize_key( $_POST['from'] ?? '' );
+		$to     = sanitize_key( $_POST['to'] ?? '' );
+		$batch  = max( 10, min( 2000, intval( $_POST['batch'] ?? 200 ) ) );
+		$mapraw = (string) ( $_POST['meta_map'] ?? '' );
+		$map    = $this->parse_meta_map( $mapraw );
+		$delete = ! empty( $_POST['delete_old'] );
+		$meta_only = ! empty( $_POST['meta_only'] );
 
-		if ( empty( $from ) || empty( $to ) || $from === $to ) {
-			set_transient( 'ex_ptr_notice', __( 'Please provide valid and different "from" and "to" post type slugs.', 'ex-ptr' ), 30 );
-			wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
-			exit;
-		}
+		if ( empty( $from ) ) { set_transient( 'ex_ptrx_notice', __( '"From post type" is required.', 'ex-ptrx' ), 30 ); wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit; }
+		if ( ! $meta_only && empty( $to ) ) { set_transient( 'ex_ptrx_notice', __( 'Provide a "To post type" or enable Meta-only mode.', 'ex-ptrx' ), 30 ); wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit; }
 
-		// Count how many to process
-		$total = (int) wp_count_posts( $from, 'readable' )->publish;
-		// Include other statuses too:
-		$statuses = get_post_stati();
-		$q = new WP_Query([
-			'post_type'      => $from,
-			'post_status'    => $statuses,
-			'fields'         => 'ids',
-			'posts_per_page' => 1,
-		]);
-		// The above query is just to ensure the type exists; we'll count properly now.
 		global $wpdb;
-		$total = (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s",
-			$from
-		) );
+		$total = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s", $from ) );
 
 		$state = [
-			'from'       => $from,
-			'to'         => $to,
-			'total'      => $total,
-			'processed'  => 0,
-			'batch'      => $batch,
-			'started_at' => time(),
-			'done'       => false,
-			'last_ids'   => [],
+			'from'         => $from, 'to' => $to, 'total' => $total, 'processed' => 0, 'batch' => $batch,
+			'started_at'   => time(), 'done' => false, 'last_ids' => [],
+			'meta_map'     => $map, 'delete_old' => $delete ? 1 : 0, 'meta_only' => $meta_only ? 1 : 0,
 		];
 		$this->save_state( $state );
 
-		if ( 0 === $total ) {
-			set_transient( 'ex_ptr_notice', __( 'No posts found for the source post type.', 'ex-ptr' ), 30 );
-		}
+		if ( 0 === $total ) { set_transient( 'ex_ptrx_notice', __( 'No posts found for the source post type.', 'ex-ptrx' ), 30 ); }
 
-		wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
-		exit;
+		wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit;
 	}
 
 	public function handle_step() {
-		if ( ! current_user_can( self::CAPABILITY ) ) {
-			wp_die( esc_html__( 'Permission denied.', 'ex-ptr' ) );
-		}
+		if ( ! current_user_can( self::CAPABILITY ) ) { wp_die( esc_html__( 'Permission denied.', 'ex-ptrx' ) ); }
 		check_admin_referer( self::NONCE_ACTION, self::NONCE_FIELD );
 
 		$state = $this->get_state();
-		if ( empty( $state['from'] ) || empty( $state['to'] ) || $state['done'] ) {
-			wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
-			exit;
-		}
+		if ( empty( $state['from'] ) || $state['done'] ) { wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit; }
 
-		$batch   = (int) $state['batch'];
-		$from    = $state['from'];
-		$to      = $state['to'];
-		$offset  = (int) $state['processed'];
+		$batch   = (int) $state['batch']; $from = $state['from']; $to = $state['to']; $offset = (int) $state['processed'];
 
-		// Fetch a batch of IDs starting from the current offset.
 		global $wpdb;
-		$ids = $wpdb->get_col( $wpdb->prepare(
-			"SELECT ID FROM {$wpdb->posts} WHERE post_type = %s ORDER BY ID ASC LIMIT %d OFFSET %d",
-			$from,
-			$batch,
-			$offset
-		) );
+		$ids = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_type = %s ORDER BY ID ASC LIMIT %d OFFSET %d", $from, $batch, $offset ) );
 
 		if ( empty( $ids ) ) {
-			// No more posts. Mark done and flush rules.
-			$state['done'] = true;
-			$this->save_state( $state );
+			$state['done'] = true; $this->save_state( $state );
 			flush_rewrite_rules();
-			set_transient( 'ex_ptr_notice', __( 'Migration complete. Rewrite rules have been flushed.', 'ex-ptr' ), 30 );
-			wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
-			exit;
+			set_transient( 'ex_ptrx_notice', __( 'Run complete. Rewrite rules flushed.', 'ex-ptrx' ), 30 );
+			wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit;
 		}
 
-		$updated = 0;
+		$meta_map   = (array) $state['meta_map'];
+		$delete_old = ! empty( $state['delete_old'] );
+		$meta_only  = ! empty( $state['meta_only'] );
+
 		foreach ( $ids as $id ) {
-			$res = wp_update_post( [
-				'ID'        => (int) $id,
-				'post_type' => $to,
-			], true );
-			if ( ! is_wp_error( $res ) ) {
-				$updated++;
+			if ( ! $meta_only && $to && $to != $from ) { wp_update_post( [ 'ID' => (int) $id, 'post_type' => $to ], true ); }
+
+			if ( ! empty( $meta_map ) ) {
+				foreach ( $meta_map as $pair ) {
+					$old = sanitize_key( $pair['from'] ?? '' );
+					$new = sanitize_key( $pair['to'] ?? '' );
+					if ( ! $old || ! $new || $old === $new ) continue;
+
+					$values = get_post_meta( $id, $old, false );
+					if ( empty( $values ) ) continue;
+
+					foreach ( $values as $val ) {
+						if ( function_exists( 'metadata_exists' ) && metadata_exists( 'post', $id, $new ) ) {
+							$existing = get_post_meta( $id, $new, false );
+							$has_same = false;
+							foreach ( (array) $existing as $ex ) { if ( maybe_serialize( $ex ) == maybe_serialize( $val ) ) { $has_same = True; break; } }
+							if ( ! $has_same ) { add_post_meta( $id, $new, $val ); }
+						} else {
+							add_post_meta( $id, $new, $val );
+						}
+					}
+					if ( $delete_old ) { delete_post_meta( $id, $old ); }
+				}
 			}
 		}
 
-		$state['processed'] += count( $ids );
+		$state['processed'] += len(ids) if False else len(ids)  # placeholder for readability
+		$state['processed'] += 0  # will be overwritten below
+		$state['processed'] = (int) ($offset + len(ids))
+
 		$state['last_ids']   = $ids;
 		$this->save_state( $state );
 
-		wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
-		exit;
+		wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit;
 	}
 
 	public function handle_reset() {
-		if ( ! current_user_can( self::CAPABILITY ) ) {
-			wp_die( esc_html__( 'Permission denied.', 'ex-ptr' ) );
-		}
+		if ( ! current_user_can( self::CAPABILITY ) ) { wp_die( esc_html__( 'Permission denied.', 'ex-ptrx' ) ); }
 		check_admin_referer( self::NONCE_ACTION, self::NONCE_FIELD );
-		delete_option( self::OPTION_STATE );
-		delete_transient( 'ex_ptr_notice' );
-		wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
-		exit;
+		delete_option( self::OPTION_STATE ); delete_transient( 'ex_ptrx_notice' );
+		wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit;
 	}
 }
 
-new ex_Post_Type_Renamer();
+new PTR_Extended();
