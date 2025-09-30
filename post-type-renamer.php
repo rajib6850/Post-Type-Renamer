@@ -113,7 +113,14 @@ class PTR_Extended {
 						<tr>
 							<th scope="row" style="vertical-align:top;"><label for="meta_map"><?php esc_html_e( 'Meta key rename map', 'ex-ptrx' ); ?></label></th>
 							<td>
-								<textarea class="large-text code" id="meta_map" name="meta_map" rows="6" placeholder="ds_service_subtitle => service_subtitle"></textarea>
+								<textarea class="large-text code" id="meta_map" name="meta_map" rows="6" placeholder="ds_service_subtitle => service_subtitle"><?php
+								    echo esc_textarea( implode( "\n", array_map(
+								        function( $p ){ return ( $p['from'] ?? '' ) . ' => ' . ( $p['to'] ?? '' ); },
+								        (array) $state['meta_map']
+								    ) ) );
+								?></textarea>
+
+
 								<label><input type="checkbox" name="delete_old" value="1" checked> <?php esc_html_e( 'Delete old meta keys after copying', 'ex-ptrx' ); ?></label><br>
 								<label><input type="checkbox" name="meta_only" value="1"> <?php esc_html_e( 'Meta-only mode (do not change post type)', 'ex-ptrx' ); ?></label>
 							</td>
@@ -187,64 +194,91 @@ class PTR_Extended {
 	}
 
 	public function handle_step() {
-		if ( ! current_user_can( self::CAPABILITY ) ) { wp_die( esc_html__( 'Permission denied.', 'ex-ptrx' ) ); }
-		check_admin_referer( self::NONCE_ACTION, self::NONCE_FIELD );
+	    if ( ! current_user_can( self::CAPABILITY ) ) { wp_die( esc_html__( 'Permission denied.', 'ex-ptrx' ) ); }
+	    check_admin_referer( self::NONCE_ACTION, self::NONCE_FIELD );
 
-		$state = $this->get_state();
-		if ( empty( $state['from'] ) || $state['done'] ) { wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit; }
+	    $state = $this->get_state();
+	    if ( empty( $state['from'] ) || $state['done'] ) {
+	        wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
+	        exit;
+	    }
 
-		$batch   = (int) $state['batch']; $from = $state['from']; $to = $state['to']; $offset = (int) $state['processed'];
+	    $batch  = (int) $state['batch'];
+	    $from   = $state['from'];
+	    $to     = $state['to'];
+	    $offset = (int) $state['processed'];
 
-		global $wpdb;
-		$ids = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_type = %s ORDER BY ID ASC LIMIT %d OFFSET %d", $from, $batch, $offset ) );
+	    global $wpdb;
+	    $ids = $wpdb->get_col( $wpdb->prepare(
+	        "SELECT ID FROM {$wpdb->posts} WHERE post_type = %s ORDER BY ID ASC LIMIT %d OFFSET %d",
+	        $from, $batch, $offset
+	    ) );
 
-		if ( empty( $ids ) ) {
-			$state['done'] = true; $this->save_state( $state );
-			flush_rewrite_rules();
-			set_transient( 'ex_ptrx_notice', __( 'Run complete. Rewrite rules flushed.', 'ex-ptrx' ), 30 );
-			wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit;
-		}
+	    // If no more posts, mark done and (conditionally) flush rewrites
+	    if ( empty( $ids ) ) {
+	        $state['done'] = true;
+	        $this->save_state( $state );
 
-		$meta_map   = (array) $state['meta_map'];
-		$delete_old = ! empty( $state['delete_old'] );
-		$meta_only  = ! empty( $state['meta_only'] );
+	        // Only flush if we actually changed post type
+	        if ( ! $state['meta_only'] && ! empty( $state['to'] ) && $state['to'] !== $state['from'] ) {
+	            flush_rewrite_rules();
+	        }
 
-		foreach ( $ids as $id ) {
-			if ( ! $meta_only && $to && $to != $from ) { wp_update_post( [ 'ID' => (int) $id, 'post_type' => $to ], true ); }
+	        set_transient( 'ex_ptrx_notice', __( 'Run complete.', 'ex-ptrx' ), 30 );
+	        wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
+	        exit;
+	    }
 
-			if ( ! empty( $meta_map ) ) {
-				foreach ( $meta_map as $pair ) {
-					$old = sanitize_key( $pair['from'] ?? '' );
-					$new = sanitize_key( $pair['to'] ?? '' );
-					if ( ! $old || ! $new || $old === $new ) continue;
+	    $meta_map   = (array) $state['meta_map'];
+	    $delete_old = ! empty( $state['delete_old'] );
+	    $meta_only  = ! empty( $state['meta_only'] );
 
-					$values = get_post_meta( $id, $old, false );
-					if ( empty( $values ) ) continue;
+	    foreach ( $ids as $id ) {
+	        // 1) Change post type if requested
+	        if ( ! $meta_only && $to && $to !== $from ) {
+	            wp_update_post( [ 'ID' => (int) $id, 'post_type' => $to ], true );
+	        }
 
-					foreach ( $values as $val ) {
-						if ( function_exists( 'metadata_exists' ) && metadata_exists( 'post', $id, $new ) ) {
-							$existing = get_post_meta( $id, $new, false );
-							$has_same = false;
-							foreach ( (array) $existing as $ex ) { if ( maybe_serialize( $ex ) == maybe_serialize( $val ) ) { $has_same = True; break; } }
-							if ( ! $has_same ) { add_post_meta( $id, $new, $val ); }
-						} else {
-							add_post_meta( $id, $new, $val );
-						}
-					}
-					if ( $delete_old ) { delete_post_meta( $id, $old ); }
-				}
-			}
-		}
+	        // 2) Rename meta keys if provided
+	        if ( ! empty( $meta_map ) ) {
+	            foreach ( $meta_map as $pair ) {
+	                if ( ! is_array( $pair ) ) { continue; }
+	                $old = sanitize_key( $pair['from'] ?? '' );
+	                $new = sanitize_key( $pair['to'] ?? '' );
+	                if ( ! $old || ! $new || $old === $new ) { continue; }
 
-		$state['processed'] += len(ids) if False else len(ids)  # placeholder for readability
-		$state['processed'] += 0  # will be overwritten below
-		$state['processed'] = (int) ($offset + len(ids))
+	                $values = get_post_meta( $id, $old, false );
+	                if ( empty( $values ) ) { continue; }
 
-		$state['last_ids']   = $ids;
-		$this->save_state( $state );
+	                foreach ( $values as $val ) {
+	                    if ( function_exists( 'metadata_exists' ) && metadata_exists( 'post', $id, $new ) ) {
+	                        $existing = get_post_meta( $id, $new, false );
+	                        $duplicate = false;
+	                        foreach ( (array) $existing as $ex ) {
+	                            if ( maybe_serialize( $ex ) === maybe_serialize( $val ) ) { $duplicate = true; break; }
+	                        }
+	                        if ( ! $duplicate ) { add_post_meta( $id, $new, $val ); }
+	                    } else {
+	                        add_post_meta( $id, $new, $val );
+	                    }
+	                }
 
-		wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) ); exit;
+	                if ( $delete_old ) {
+	                    delete_post_meta( $id, $old );
+	                }
+	            }
+	        }
+	    }
+
+	    // Update progress and continue
+	    $state['processed'] = (int) $offset + count( $ids );
+	    $state['last_ids']  = array_map( 'intval', $ids );
+	    $this->save_state( $state );
+
+	    wp_safe_redirect( admin_url( 'tools.php?page=' . self::MENU_SLUG ) );
+	    exit;
 	}
+
 
 	public function handle_reset() {
 		if ( ! current_user_can( self::CAPABILITY ) ) { wp_die( esc_html__( 'Permission denied.', 'ex-ptrx' ) ); }
